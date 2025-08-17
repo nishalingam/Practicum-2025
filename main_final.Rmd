@@ -1,0 +1,1354 @@
+### Evaluating the Joint Effects of O3, PM2.5, and NO2 as an Exposure Mixture on Mortality
+
+The principal health-related question I am interested in answering is: What are the health impacts of air pollutants and their complex "mixture effects"? Specifically, I aim to study the associations between mortality as the outcome of interest with the mixture of ozone, PM2.5, and NO2 levels, as the exposure of interest in order to create models to predict the effects of such exposures on this outcome. I plan to use a combined approach using weighted quantile sum (WQS) regression with the help of quantile g-computation to look at the differences in mortality at the county level based on the exposure mixture level. Additionally, this project will focus on counties within New York state and the following year range: 2000-2016. 
+
+# Covariates list
+white_pct: proportion of population made up of white residents 
+hispanic_pct: propotion of population made up of Hispanic residents
+blk_pct: proportion of population made up of black residents
+native_pct: proportion of population made up of Native American residents
+asian_pct: proportion of population made up of Asian residents
+no_grad: proportion of population made up of residents who did not graduate high school
+no_grad_mcare: proportion of population made up of residents who did not graduate high school and are on MediCare
+log_med_house: log of median house price
+poverty: proportion of population made up of residents living in poverty
+log_med_income: log of median income
+owner_occupied: proportion of population made up of residents owning and occupying residences
+median_age: median age
+age_pct_0_14: proportion of population made up of residents aged 0-14 years old
+age_pct_15_44: proportion of population made up of residents aged 15-44 years old
+age_pct_45_65: proportion of population made up of residents aged 45-65 years old
+age_pct_65_plus: proportion of population made up of residents aged 65 years old or older
+log_ndvi: log of NDVI
+
+```{r, echo=FALSE, message=FALSE}
+library(tidyr)
+library(dplyr)
+library(tidyverse)
+library(readr)
+library(stringr)
+library(lubridate)
+library(purrr)
+
+library(zoo)
+library(splines)
+library(lme4)
+
+library(gWQS)
+library(qgcomp)
+library(ggplot2)
+# library(knitr)
+library(kableExtra)
+library(reshape2)
+library(car)
+library(stats)
+library(readxl)
+
+library(future)
+library(callr)
+
+library(corrplot)
+
+```
+
+### PM2.5 Data
+```{r}
+# Read all PM2.5 data files for the years 2000 to 2016
+pm25_files <- list.files("data/PM25_daily_2000_2016_county", 
+                         pattern = "\\.csv\\.gz$", full.names = TRUE)
+
+# Load all files into a list of data frames
+pm25_list <- lapply(pm25_files, read_csv)
+
+# Extract the year from each file and assign it as a new column to each dataframe
+pm25_list <- lapply(1:length(pm25_list), function(i) {
+  pm25_list[[i]]$year <- as.numeric(sub(".*([0-9]{4})\\.csv\\.gz$", "\\1", pm25_files[i]))
+  return(pm25_list[[i]])
+})
+
+# Combine all the datasets into one by joining them
+pm25_all <- Reduce(function(x, y) full_join(x, y, by = c("GEOID10", "population")), pm25_list)
+
+
+head(pm25_all)
+
+```
+
+```{r}
+
+year_columns <- grep("year", colnames(pm25_all), ignore.case = TRUE)
+df <- pm25_all[, -year_columns]
+
+print(length(colnames(pm25_all)))
+print(length(colnames(df)))
+```
+
+```{r}
+# Check the first few column names to inspect their format
+print(head(colnames(df)))
+
+# Convert column names from YYYYMMDD to YYYY-MM-DD format (character string with dashes)
+colnames(df)[-c(1, 2)] <- format(as.Date(colnames(df)[-c(1, 2)], format = "%Y%m%d"), "%Y-%m-%d")
+
+# Check the column names after conversion to confirm they are in Date format
+print(head(colnames(df)))
+
+# Now, proceed with reshaping the data
+df_long <- df %>%
+  pivot_longer(cols = -c(GEOID10, population), names_to = "Date", values_to = "Value")
+
+# Check the structure of the 'Date' column to ensure it's in Date format
+str(df_long$Date)
+
+# Convert 'Date' column to Date format if necessary (it should already be)
+df_long <- df_long %>%
+  mutate(Date = as.Date(Date))
+
+# Create the Month column for monthly averages
+df_long <- df_long %>%
+  mutate(Month = format(Date, "%Y-%m"))
+
+# Calculate the monthly averages
+df_avg_monthly <- df_long %>%
+  group_by(GEOID10, Month) %>%
+  summarise(Monthly_Avg = mean(Value, na.rm = TRUE), .groups = "drop")
+
+# Pivot the data back to wide format with months as columns
+df_avg_monthly_wide <- df_avg_monthly %>%
+  pivot_wider(names_from = Month, values_from = Monthly_Avg)
+
+# View the result
+# print(df_avg_monthly_wide)
+df_filtered <- df_avg_monthly_wide |>
+  filter(startsWith(GEOID10, "36"))
+
+# View the result
+# print(head(df_avg_monthly_wide))
+print(df_filtered)
+
+
+```
+
+
+### NO2 Data
+```{r}
+# Read all PM2.5 data files for the years 2000 to 2016
+no2_files <- list.files("data/NO2_daily_2000_2016_county/NO2_2000_2016_county", 
+                         pattern = "\\.csv\\.gz$", full.names = TRUE)
+
+# Load all files into a list of data frames
+no2_list <- lapply(no2_files, read_csv)
+
+# Extract the year from each file and assign it as a new column to each dataframe
+no2_list <- lapply(1:length(no2_list), function(i) {
+  no2_list[[i]]$year <- as.numeric(sub(".*([0-9]{4})\\.csv\\.gz$", "\\1", no2_files[i]))
+  return(no2_list[[i]])
+})
+
+# Combine all the datasets into one by joining them
+no2_all <- Reduce(function(x, y) full_join(x, y, by = c("GEOID10", "population")), no2_list)
+
+# no2_all <- no2_all[, !colnames(pm25_all) %in% "NA"]
+
+# Check the result
+head(no2_all)
+```
+
+```{r}
+# print(head(no2_all))
+# df_no2 <- no2_all[, !is.na(colnames(no2_all))]
+year_columns2 <- grep("year", colnames(no2_all), ignore.case = TRUE)
+df_no2 <- no2_all[, -year_columns2]
+
+print(length(colnames(no2_all)))
+print(length(colnames(df_no2)))
+# print(head(df_no2))
+```
+
+```{r}
+# Check the first few column names to inspect their format
+print(head(colnames(df_no2)))
+
+# Convert column names from YYYYMMDD to YYYY-MM-DD format (character string with dashes)
+colnames(df_no2)[-c(1, 2)] <- format(as.Date(colnames(df_no2)[-c(1, 2)], format = "%Y%m%d"), "%Y-%m-%d")
+
+# Check the column names after conversion to confirm they are in Date format
+print(head(colnames(df_no2)))
+
+# Now, proceed with reshaping the data
+df_no2_long <- df_no2 %>%
+  pivot_longer(cols = -c(GEOID10, population), names_to = "Date", values_to = "Value")
+
+# Check the structure of the 'Date' column to ensure it's in Date format
+str(df_no2_long$Date)
+
+# Convert 'Date' column to Date format if necessary (it should already be)
+df_no2_long <- df_no2_long %>%
+  mutate(Date = as.Date(Date))
+
+# Create the Month column for monthly averages
+df_no2_long <- df_no2_long %>%
+  mutate(Month = format(Date, "%Y-%m"))
+
+# Calculate the monthly averages
+df_no2_avg_monthly <- df_no2_long %>%
+  group_by(GEOID10, Month) %>%
+  summarise(Monthly_Avg = mean(Value, na.rm = TRUE), .groups = "drop")
+
+# Pivot the data back to wide format with months as columns
+df_no2_avg_monthly_wide <- df_no2_avg_monthly %>%
+  pivot_wider(names_from = Month, values_from = Monthly_Avg)
+
+# View the result
+# print(df_no2_avg_monthly_wide)
+df_no2_filtered <- df_no2_avg_monthly_wide |>
+  filter(startsWith(GEOID10, "36"))
+
+# View the result
+# print(head(df_avg_monthly_wide))
+print(df_no2_filtered)
+```
+
+### O3 Data
+```{r}
+# Read all PM2.5 data files for the years 2000 to 2016
+o3_files <- list.files("data/Ozone_daily_2000_2016_county/Ozone_2000_2016_county", 
+                         pattern = "\\.csv\\.gz$", full.names = TRUE)
+
+# Load all files into a list of data frames
+o3_list <- lapply(o3_files, read_csv)
+
+# Extract the year from each file and assign it as a new column to each dataframe
+o3_list <- lapply(1:length(o3_list), function(i) {
+  o3_list[[i]]$year <- as.numeric(sub(".*([0-9]{4})\\.csv\\.gz$", "\\1", o3_files[i]))
+  return(o3_list[[i]])
+})
+
+# Combine all the datasets into one by joining them
+o3_all <- Reduce(function(x, y) full_join(x, y, by = c("GEOID10", "population")), o3_list)
+
+# o3_all <- o3_all[, !colnames(pm25_all) %in% "NA"]
+
+# Check the result
+head(o3_all)
+```
+
+```{r}
+# print(head(o3_all))
+df_o3 <- o3_all[, !grepl("\\.(x|y)$", colnames(o3_all)) & !grepl("year", colnames(o3_all), ignore.case = TRUE)]
+
+# Remove columns with NA or empty names
+df_o3 <- df_o3[, !is.na(colnames(df_o3))]
+
+print(length(colnames(o3_all)))
+print(length(colnames(df_o3)))
+# print(head(df_o3))
+
+# # Check if any column names are NA or empty
+# na_cols <- which(is.na(colnames(o3_all)) | colnames(o3_all) == "")
+# print(na_cols)  # Prints the indices of the columns with NA or empty names
+# 
+# # Check the actual column names that are NA or empty
+# na_colnames <- colnames(o3_all)[na_cols]
+# print(na_colnames)
+
+```
+
+```{r}
+# Check the first few column names to inspect their format
+print(head(colnames(df_o3)))
+
+# Convert column names from YYYYMMDD to YYYY-MM-DD format (character string with dashes)
+colnames(df_o3)[-c(1, 2)] <- format(as.Date(colnames(df_o3)[-c(1, 2)], format = "%Y%m%d"), "%Y-%m-%d")
+
+# Check the column names after conversion to confirm they are in Date format
+print(head(colnames(df_o3)))
+
+# Now, proceed with reshaping the data
+df_o3_long <- df_o3 %>%
+  pivot_longer(cols = -c(GEOID10, population), names_to = "Date", values_to = "Value")
+
+# Check the structure of the 'Date' column to ensure it's in Date format
+str(df_o3_long$Date)
+
+# Convert 'Date' column to Date format if necessary (it should already be)
+df_o3_long <- df_o3_long %>%
+  mutate(Date = as.Date(Date))
+
+# Create the Month column for monthly averages
+df_o3_long <- df_o3_long %>%
+  mutate(Month = format(Date, "%Y-%m"))
+
+# Calculate the monthly averages
+df_o3_avg_monthly <- df_o3_long %>%
+  group_by(GEOID10, Month) %>%
+  summarise(Monthly_Avg = mean(Value, na.rm = TRUE), .groups = "drop")
+
+# Pivot the data back to wide format with months as columns
+df_o3_avg_monthly_wide <- df_o3_avg_monthly %>%
+  pivot_wider(names_from = Month, values_from = Monthly_Avg)
+
+# View the result
+# print(df_o3_avg_monthly_wide)
+df_o3_filtered <- df_o3_avg_monthly_wide |>
+  filter(startsWith(GEOID10, "36"))
+
+# View the result
+# print(head(df_avg_monthly_wide))
+print(df_o3_filtered)
+```
+
+```{r}
+# Reshape each pollutant dataframe from wide to long format
+df1_long <- df_filtered %>%
+  gather(key = "year_month", value = "pm25", -GEOID10)
+
+df2_long <- df_no2_filtered %>%
+  gather(key = "year_month", value = "no2", -GEOID10)
+
+df3_long <- df_o3_filtered %>%
+  gather(key = "year_month", value = "o3", -GEOID10)
+
+# Merge the three long-format dataframes by 'GEOID10' and 'year_month'
+df_combined <- df1_long %>%
+  left_join(df2_long, by = c("GEOID10", "year_month")) %>%
+  left_join(df3_long, by = c("GEOID10", "year_month"))
+
+# Sort the data first by GEOID10 (zipcode) and then by year_month
+df_sorted <- df_combined %>%
+  arrange(GEOID10, year_month)
+
+# View the final sorted dataframe
+head(df_sorted)
+print(df_sorted)
+
+unique(df_sorted$year_month)
+
+# Check for any rows containing NA values
+rows_with_na <- df_sorted[apply(df_sorted, 1, function(row) any(is.na(row))), ]
+
+# Print the rows with NA values
+print(rows_with_na)
+
+```
+
+### Mortality Data
+```{r}
+# Read in the entire data from 2000-2016
+death_all <- read_delim("data/Underlying Cause of Death, 2000-2016.txt")
+
+# Filter rows where all columns except 'Notes' are NA
+cleaned_death_data <- death_all %>%
+  filter(rowSums(is.na(select(., -Notes))) < ncol(.) - 1)
+
+# Clean up the 'Month' column by removing commas and extra spaces
+cleaned_death_data$Month <- str_replace_all(cleaned_death_data$Month, ",", "")  # Remove commas
+
+cleaned_death_data$Month <- str_replace_all(cleaned_death_data$Month, "\\.", "")  # Remove periods
+
+cleaned_death_data$Month <- str_trim(cleaned_death_data$Month)  # Remove leading/trailing spaces
+
+unique(cleaned_death_data$Month)
+head(cleaned_death_data)
+```
+
+```{r}
+# Create a lookup for month abbreviations and map them to numeric months
+month_lookup <- c("Jan" = "01", "Feb" = "02", "Mar" = "03", "Apr" = "04", "May" = "05", "Jun" = "06", 
+                  "Jul" = "07", "Aug" = "08", "Sep" = "09", "Oct" = "10", "Nov" = "11", "Dec" = "12")
+
+death_all_clean <- cleaned_death_data %>%
+  mutate(
+    # Create Month_Code as "YYYY-MM" from 'Month' column
+    Month_Code = paste0(str_extract(Month, "\\d{4}"), "-", month_lookup[str_extract(Month, "^[A-Za-z]+")]),
+    
+    # Clean the County_Code column
+    County_Code = as.character(`County Code`),
+    
+    # Ensure Deaths is numeric and handle any non-numeric issues, replacing NAs in Deaths with 0
+    Deaths = coalesce(as.numeric(Deaths), 0)  # Replace NAs in Deaths with 0
+  ) %>%
+  # Select the required columns (County_Code, County, Month_Code, Deaths)
+  select(County_Code, County, Month_Code, Deaths)
+
+# Inspect the cleaned data
+head(death_all_clean)
+
+# # Check for any rows where other columns have NA values (excluding Deaths)
+# cleaned_death_data %>%
+# filter(is.na(County_Code) | is.na(County) | is.na(Month_Code))
+
+# Check the first few values of `County_Code` and `GEOID10` to ensure they match
+head(death_all_clean$County_Code)
+head(df_sorted$GEOID10)
+
+# Check the first few values of `Month_Code` and `year_month` to ensure they match
+head(death_all_clean$Month_Code)
+head(df_sorted$year_month)
+```
+
+```{r}
+# Merge with the pollutant dataset using appropriate keys
+merged_data <- left_join(df_sorted, death_all_clean, by = c("GEOID10" = "County_Code", "year_month" = "Month_Code"))
+
+na_rows <- merged_data %>% filter(is.na(Deaths))
+print(na_rows)
+
+merged_data <- merged_data %>%
+  mutate(
+    year = as.integer(substr(year_month, 1, 4)),
+    month = substr(year_month, 6, 7)
+  )
+
+# Check the merged data
+head(merged_data)
+nrow(merged_data)
+```
+
+```{r}
+covars <- read_csv("data/census_county_interpolated.csv")
+head(covars)
+```
+
+```{r}
+covars <- arrange(covars, fips) |> 
+  filter(year %in% c(2000, 2001, 2002, 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011, 2012, 2013, 2014, 2015, 2016)) |> 
+  mutate(fips = str_pad(fips, width = 5, side = "left", pad = "0")) |>
+  filter(str_starts(fips, "36"))
+
+print(covars)
+colnames(covars)
+```
+
+```{r}
+# Perform the left join, while ensuring we don't overwrite County or Deaths columns
+combined_data <- merged_data %>%
+  left_join(covars, by = c("year" = "year", "GEOID10" = "fips")) |>
+  mutate(Deaths = ifelse(is.na(Deaths), 0, Deaths)) |>
+  mutate(death_rate = Deaths/population) |>
+  mutate(log_death_rate = log(death_rate + 1)) |>
+  mutate(log_deaths = log(Deaths + 1)) |>
+  mutate(log_med_house = log(median_house_value)) |>
+  mutate(log_med_income = log(median_household_income))
+
+
+# Ensure 'County' and 'Deaths' from merged_data are retained and no duplication of columns occurs
+combined_data <- combined_data %>%
+  dplyr::select(
+    GEOID10, year, year_month, pm25, no2, o3, County, Deaths, log_deaths, death_rate, log_death_rate,
+    hispanic_pct, poverty, population, median_house_value, log_med_house,
+    blk_pct, white_pct, native_pct, asian_pct, no_grad,
+    no_grad_mcare, median_household_income, log_med_income, owner_occupied,
+    median_age, age_pct_0_14, age_pct_15_44, age_pct_45_65,
+    age_pct_65_plus, population_density
+  )
+
+# Print the resulting combined data
+head(combined_data)
+
+missing_county_data <- combined_data |> filter(is.na(Deaths))
+print(missing_county_data)
+
+missing_county_data <- combined_data |> filter(is.na(Deaths))
+print(missing_county_data)
+
+head(combined_data)
+```
+
+```{r}
+# Find rows with any NA values
+na_rows <- apply(combined_data, 1, function(x) any(is.na(x)))
+
+# Show the rows with NA values
+combined_data[na_rows, ]
+```
+
+# NDVI Data
+```{r}
+# List all CSV files in the folder
+csv_files <- list.files(path = "C:/Users/ahsin/OneDrive/Desktop/2025-practicum/data/NDVI_16day_2000_2023_county", pattern = "*.csv", full.names = TRUE)
+
+# Function to read and process each CSV file
+process_file <- function(file_path) {
+   # Read the CSV file
+  df <- read_csv(file_path)
+  
+  # Filter for GEOID10 values starting with "36" (New York state)
+  df <- df %>% filter(startsWith(GEOID10, "36"))
+  
+  # Extract the year and day of year from the filename
+  filename <- basename(file_path)
+  
+  # Print the filename for debugging purposes
+  print(paste("Processing file:", filename))
+  
+  # Extract year and day of year from the filename
+  year <- substr(filename, 1, 4)  # Extract year (first 4 digits)
+  day_of_year <- substr(filename, 5, 7)  # Extract day of year (last 3 digits)
+  
+  # Print year and day_of_year for debugging
+  print(paste("Year:", year, "Day of Year:", day_of_year))
+  
+  # Convert day of year to Date (e.g., day 065 -> March 5)
+  # Ensure day_of_year is numeric and add leading zeros if needed
+  day_of_year <- as.numeric(day_of_year)
+  
+  # Now we can safely convert to Date with the proper origin (first day of the year)
+  date <- as.Date(day_of_year, origin = paste0(year, "-01-01"))
+  
+  # Print the date for debugging
+  print(paste("Converted Date:", date))
+  
+  # Ensure the year_month is extracted from the converted date (this is the key part!)
+  year_month <- format(date, "%Y-%m")  # Get year and month as "YYYY-MM"
+  
+  # Print the year_month for debugging
+  print(paste("Year-Month:", year_month))
+  
+  # Add the year_month column to the dataframe
+  df$year_month <- year_month
+  
+  return(df)
+}
+
+# Apply the process_file function to all CSV files and store the results in a list
+ndvi_data_list <- map(csv_files, process_file)
+
+# Combine all the CSV files into a single dataframe
+ndvi_data <- bind_rows(ndvi_data_list)
+
+# Preview the NDVI data
+head(ndvi_data)
+
+
+length(unique(ndvi_data$GEOID10))
+length(unique(combined_data$GEOID10))
+
+length(unique(combined_data$year_month))
+length(unique(ndvi_data$year_month))
+
+check <- ndvi_data |> filter(is.na(ndvi))
+print(check)
+
+# Assuming combined_data is your main dataframe
+combined_data <- combined_data %>%
+  left_join(ndvi_data, by = c("GEOID10", "year_month"))
+
+combined_data <- combined_data |> mutate(log_ndvi = log(ndvi))
+
+# Check the combined data to ensure correct merging
+head(combined_data)
+
+check2 <- combined_data |> filter(is.na(ndvi))
+print(check2)
+
+qg_combined_data <- combined_data |> select(-County)
+
+
+exposure_vars <- c("pm25", "no2", "o3")
+
+qg_combined_data2 <- qg_combined_data %>%
+  arrange(GEOID10, year_month) %>%
+  group_by(GEOID10) %>%
+  fill(ndvi, log_ndvi, .direction = "down") %>%
+  fill(ndvi, log_ndvi, .direction = "up") %>%
+  ungroup()
+```
+
+```{r}
+
+# Convert year_month (character) to Date using as.yearmon
+qg_combined_data2$year_month_date <- as.yearmon(qg_combined_data2$year_month, "%Y-%m")
+
+# Check the conversion
+head(qg_combined_data2$year_month_date)
+
+# Convert 'year_month_date' to numeric (months since a baseline)
+qg_combined_data2$year_month_numeric <- as.numeric(qg_combined_data2$year_month_date)
+
+# Check the numeric representation
+head(qg_combined_data2$year_month_numeric)
+```
+
+## FINAL DATASET HERE
+```{r}
+qg_combined_data2 <- readRDS("data/qg_combined_data2.rds")
+
+```
+
+```{r}
+# Check the first few rows of both datasets
+head(merged_data)
+head(covars)
+
+# Check unique values of year and GEOID10 in both datasets to ensure they match
+unique(merged_data$year)
+unique(covars$year)
+
+unique(merged_data$GEOID10)
+unique(covars$fips)
+
+# Identify rows with any NA values
+na_rows <- combined_data[apply(combined_data, 1, function(x) any(is.na(x))), ]
+
+# Print the rows with NA values
+print(na_rows)
+```
+
+
+### EDA
+```{r}
+# Descriptive statistics
+summary(combined_data)
+
+# For categorical data
+table(combined_data$County)
+
+# For numeric data (mean, sd, min, max, etc.)
+combined_data %>%
+  dplyr::select(pm25, no2, o3, Deaths, hispanic_pct, poverty, population, median_house_value) %>%
+  summary()
+
+
+```
+
+
+```{r}
+
+library(ggplot2)
+# Visualize distributions
+ggplot(combined_data, aes(x = pm25)) + geom_histogram(binwidth = 0.5) + ggtitle("PM2.5 Distribution")
+ggplot(combined_data, aes(x = no2)) + geom_histogram(binwidth = 0.5) + ggtitle("NO2 Distribution")
+ggplot(combined_data, aes(x = o3)) + geom_histogram(binwidth = 0.5) + ggtitle("O3 Distribution")
+ggplot(combined_data, aes(x = Deaths)) + geom_histogram(binwidth = 5) + ggtitle("Deaths Distribution")
+ggplot(combined_data, aes(x = death_rate)) + geom_histogram(binwidth = 0.00001) + ggtitle("Mortality Rate Distribution")
+
+corr_data <- combined_data %>% dplyr::select(pm25, no2, o3, Deaths, death_rate, poverty, population, median_house_value, hispanic_pct, poverty, population, median_house_value,
+    blk_pct, white_pct, native_pct, asian_pct, no_grad,
+    no_grad_mcare, median_household_income, owner_occupied,
+    median_age, age_pct_0_14, age_pct_15_44, age_pct_45_65,
+    age_pct_65_plus, population_density, ndvi, log_ndvi)
+cor_matrix <- cor(corr_data, use = "complete.obs")
+corrplot(cor_matrix, method = "circle", type = "lower", tl.cex = 0.7)
+```
+
+
+
+```{r}
+# head(combined_data)
+vif_model <- lm(Deaths ~ pm25 + no2 + o3 + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + no_grad + no_grad_mcare + log_med_house + poverty + log_med_income + owner_occupied + median_age + age_pct_0_14 + age_pct_15_44 + age_pct_45_65 + age_pct_65_plus + log_ndvi, data = combined_data)
+vif(vif_model)
+
+# Check the correlation matrix of predictor variables
+cor_matrix <- cor(combined_data[, c("pm25", "no2", "o3", "white_pct", "hispanic_pct", "blk_pct", 
+                                    "native_pct", "asian_pct", "no_grad", "no_grad_mcare", "log_med_house", 
+                                    "poverty", "log_med_income", "owner_occupied", "median_age", "age_pct_0_14", 
+                                    "age_pct_15_44", "age_pct_45_65", "age_pct_65_plus")])
+
+# Print the correlation matrix
+print(cor_matrix)
+
+# Find highly correlated variables (e.g., correlation > 0.95)
+high_cor_vars <- which(abs(cor_matrix) > 0.95, arr.ind = TRUE)
+print(high_cor_vars)
+
+
+# Scatter plot for all pollutants (pm25, no2, o3) vs Deaths
+ggplot(combined_data, aes(x = pm25, y = Deaths)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + ggtitle("PM2.5 vs Deaths")
+ggplot(combined_data, aes(x = no2, y = Deaths)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + ggtitle("NO2 vs Deaths")
+ggplot(combined_data, aes(x = o3, y = Deaths)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + ggtitle("Ozone vs Deaths")
+
+ggplot(combined_data, aes(x = pm25, y = death_rate)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + ggtitle("PM2.5 vs Death Rate")
+ggplot(combined_data, aes(x = no2, y = death_rate)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + ggtitle("NO2 vs Death Rate")
+ggplot(combined_data, aes(x = o3, y = death_rate)) + geom_point() + geom_smooth(method = "lm", se = FALSE) + ggtitle("Ozone vs Death Rate")
+
+cor(combined_data[, c("pm25", "no2", "o3")])
+
+
+```
+
+
+
+```{r}
+
+# Check mean vs variance for Poisson-like data
+mean(combined_data$Deaths)
+var(combined_data$Deaths)
+
+# Histogram of death_rate
+hist(combined_data$death_rate)
+
+# Q-Q plot for normality
+qqnorm(combined_data$death_rate)
+qqline(combined_data$death_rate)
+
+# Shapiro-Wilk test for normality
+shapiro.test(combined_data$death_rate)
+
+# Histogram of log_death_rate
+hist(combined_data$log_death_rate)
+
+# Q-Q plot for normality
+qqnorm(combined_data$log_death_rate)
+qqline(combined_data$log_death_rate)
+
+# Shapiro-Wilk test for normality
+shapiro.test(combined_data$log_death_rate)
+
+```
+
+
+
+```{r}
+# Count of zero deaths (if using Poisson regression)
+table(combined_data$Deaths == 0)
+length(combined_data$Deaths)
+
+# Fit a Poisson model (example)
+poisson_model <- glm(Deaths ~ pm25 + no2 + o3 + poverty + population, family = poisson(), data = combined_data)
+
+# Check for overdispersion
+dispersion_test <- sum(residuals(poisson_model, type = "pearson")^2) / poisson_model$df.residual
+dispersion_test
+
+# Check for temporal patterns in Deaths
+ggplot(combined_data, aes(x = year_month)) + 
+  geom_line(aes(y = Deaths), color = "blue") + 
+  ggtitle("Deaths Over Time")
+
+# Fit a linear model (for diagnostics)
+lm_model <- lm(Deaths ~ pm25 + no2 + o3, data = combined_data)
+
+# Plot residuals
+plot(lm_model, which = 1)  # Residuals vs Fitted plot
+
+```
+
+### gWQS Analysis
+
+We found that for each decile increase in the levels of the PM2.5 mixture, the rate of all-cause mortality
+increased by 1.4% (95% CI: 1.3%–1.4%). 
+
+The highest weights for harmful effects were due to NO2 and O3.
+
+Long-term exposure to PM2.5, O3, and NO2, as a mixture, increased the risk of all-cause mortality.
+```{r}
+colnames(combined_data)
+
+# outcome_variable_poisson <- "Deaths"  
+# outcome_variable_normal <- "log_death_rate" 
+# 
+# covariates <- c("hispanic_pct", "poverty", "median_house_value", "blk_pct", "white_pct", 
+#               "native_pct", "asian_pct", "no_grad", "no_grad_mcare", "median_household_income", 
+#               "owner_occupied", "median_age", "age_pct_0_14", "age_pct_15_44", "age_pct_45_65", 
+#               "age_pct_65_plus", "population_density")
+
+```
+
+## NOAA Filtered Data
+```{r}
+noaa_combined <- qg_combined_data2 |> filter(pm25 > 9 | o3 > 70 | no2 > 53)
+noaa_combined
+
+```
+
+
+
+### Poisson GLMs for Each Pollutant and Deaths only
+```{r}
+### run poisson GLM for ozone alone
+# Convert 'year_month' to a factor (if it's not already)
+combined_data_factor <- qg_combined_data2
+combined_data_factor$GEOID10 <- as.factor(combined_data_factor$GEOID10)
+
+# Fit a Poisson GLM
+model2 <- glm(Deaths ~ o3 + GEOID10, data = combined_data_factor, family = poisson())
+
+# Summary of the model
+summary(model2)
+
+# Fit a Poisson GLM
+model3 <- glm(Deaths ~ pm25 + GEOID10, data = combined_data_factor, family = poisson())
+
+# Summary of the model
+summary(model3)
+
+# Fit a Poisson GLM
+model4 <- glm(Deaths ~ no2 + GEOID10, data = combined_data_factor, family = poisson())
+
+# Summary of the model
+summary(model4)
+```
+
+### FINAL GWQS ANALYSIS: All Covariates Included WITH NDVI, 2000-2016 with fixed effects included
+```{r}
+qg_combined_data2 <- readRDS("data/qg_combined_data2.rds")
+exposure_vars <- c("pm25", "no2", "o3")
+```
+
+```{r}
+start.time <- Sys.time()
+
+results_ndvi_allyrs <- gwqs(Deaths ~ wqs + pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + log_med_income + owner_occupied + median_age + log_ndvi + factor(GEOID10) + ns(year_month_numeric, df=10) + offset(log(population)),
+               mix_name = exposure_vars, 
+               data = qg_combined_data2, 
+               q = 10,                 # number of quantiles (deciles)
+               validation = 0.6,       # 60% for validation, 40% for training
+               b = 100,                  # 100 bootstrap samples for parameter estimation (increase for practical use)
+               b1_pos = TRUE,          # positive index
+               rh = 100,                 # 100 repeated holdout steps
+               family = "quasipoisson",     
+               seed = 2016)
+
+summary(results_ndvi_allyrs)
+
+# bar plot
+gwqs_barplot(results_ndvi_allyrs)
+# scatter plot y vs wqs
+gwqs_scatterplot(results_ndvi_allyrs)
+# scatter plot residuals vs fitted values
+gwqs_fitted_vs_resid(results_ndvi_allyrs)
+# boxplot of the weights estimated at each repeated holdout step
+gwqs_boxplot(results_ndvi_allyrs)
+
+head(results_ndvi_allyrs$final_weights)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+```
+
+```{r}
+
+summary(results_ndvi_allyrs)
+```
+
+
+### FINAL: NO COVARIATES except for POP OFFSET - ALL YEARS
+```{r}
+start.time <- Sys.time()
+
+results_allyrs <- gwqs(Deaths ~ wqs + offset(log(population)),
+               mix_name = exposure_vars, 
+               data = combined_data, 
+               q = 10,                 # Specify the number of quantiles (deciles)
+               validation = 0.6,       # 60% for validation, 40% for training
+               b = 100,                  # Bootstrap samples for parameter estimation (increase for practical use)
+               b1_pos = TRUE,          # Specify if you want to include the positive index
+               rh = 100,                 # Perform 5 repeated holdout steps
+               family = "quasipoisson",     
+               seed = 2016)
+
+summary(results_allyrs)
+
+# bar plot
+gwqs_barplot(results_allyrs)
+# scatter plot y vs wqs
+gwqs_scatterplot(results_allyrs)
+# scatter plot residuals vs fitted values
+gwqs_fitted_vs_resid(results_allyrs)
+# boxplot of the weights estimated at each repeated holdout step
+gwqs_boxplot(results_allyrs)
+
+head(results_allyrs$final_weights)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+```
+
+# Covariates - ALL years, 100 bootstrap, 100 RH
+```{r}
+start.time <- Sys.time()
+
+results_all <- gwqs(Deaths ~ wqs + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + no_grad_mcare + log_med_income + owner_occupied + median_age + offset(log(population)),
+               mix_name = exposure_vars, 
+               data = combined_data, 
+               q = 10,                 # Specify the number of quantiles (deciles)
+               validation = 0.6,       # 60% for validation, 40% for training
+               b = 100,                  # Bootstrap samples for parameter estimation (increase for practical use)
+               b1_pos = TRUE,          # Specify if you want to include the positive index
+               rh = 100,                 # Perform 5 repeated holdout steps
+               family = "quasipoisson",     
+               seed = 2016)
+
+summary(results_all)
+
+# bar plot
+gwqs_barplot(results_all)
+# scatter plot y vs wqs
+gwqs_scatterplot(results_all)
+# scatter plot residuals vs fitted values
+gwqs_fitted_vs_resid(results_all)
+# boxplot of the weights estimated at each repeated holdout step
+gwqs_boxplot(results_all)
+
+head(results_all$final_weights)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+```
+
+
+
+
+## qgComp Results
+
+```{r}
+corr_exposure_data <- combined_data %>% dplyr::select(pm25, no2, o3)
+cor_exposure_matrix <- cor(corr_exposure_data, use = "complete.obs")
+corrplot(cor_exposure_matrix, method = "circle", type = "lower", tl.cex = 0.7)
+```
+
+
+```{r}
+qg_combined_data <- combined_data
+# filter(!is.na(log_ndvi))
+head(qg_combined_data)
+set.seed(50)
+```
+
+```{r}
+qg_results2 = qgcomp.noboot(Deaths ~ NULL, data=qg_combined_data,
+                     expnms=exposure_vars,
+                     family=poisson(), q=20)
+print(qg_results2)
+
+```
+
+```{r}
+qg_results2b = qgcomp.noboot(Deaths ~ pm25 + no2 + o3, data=qg_combined_data,
+                     expnms=exposure_vars,
+                     family=poisson(), q=10)
+print(qg_results2b)
+```
+
+```{r}
+start.time <- Sys.time()
+
+set.seed(50)
+# print(exposure_vars)
+
+qg_results3a = qgcomp.glm.noboot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + no_grad_mcare + log_med_income + owner_occupied + median_age + log_ndvi + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=qg_combined_data, family=poisson(), q=10, bayes=TRUE)
+
+print(qg_results3a)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+```
+
+ 
+```{r}
+start.time <- Sys.time()
+
+set.seed(50)
+print(exposure_vars)
+
+qg_results3 = qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + no_grad_mcare + log_med_income + owner_occupied + median_age + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=qg_combined_data, family=poisson(), q=10, bayes=FALSE)
+  # qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3 + offset(log(population)), data=combined_01,
+  #                  expnms=exposure_vars,
+  #                  family=poisson(), q=10, breaks=NULL, weights, alpha = 0.05, B = 200, rr = TRUE, degree = 1, bayes=FALSE, MCsize=nrow(combined_01))
+
+print(qg_results3)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+```
+
+```{r}
+# Find rows with any NA values
+na_rows <- apply(qg_combined_data, 1, function(x) any(is.na(x)))
+
+# Show the rows with NA values
+qg_combined_data[na_rows, ]
+
+head(qg_combined_data)
+
+qg_combined_data2 <- qg_combined_data %>%
+  arrange(GEOID10, year_month) %>%
+  group_by(GEOID10) %>%
+  fill(ndvi, log_ndvi, .direction = "down") %>%
+  fill(ndvi, log_ndvi, .direction = "up") %>%
+  ungroup()
+
+# Find rows with any NA values
+na_rows <- apply(qg_combined_data2, 1, function(x) any(is.na(x)))
+
+# Show the rows with NA values
+qg_combined_data2[na_rows, ]
+
+```
+
+# qgcomp Models with Imputed NDVI
+```{r}
+start.time <- Sys.time()
+
+set.seed(50)
+# print(exposure_vars)
+
+qg_results3b_no = qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + no_grad_mcare + log_med_income + owner_occupied + median_age + log_ndvi + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=qg_combined_data2, family=poisson(), q=10, B=200, bayes=TRUE)
+  # qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3 + offset(log(population)), data=combined_01,
+  #                  expnms=exposure_vars,
+  #                  family=poisson(), q=10, breaks=NULL, weights, alpha = 0.05, B = 200, rr = TRUE, degree = 1, bayes=FALSE, MCsize=nrow(combined_01))
+
+print(qg_results3b_no)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+
+
+```
+$[ \mathbb{E}(Y^{\mathbf{X}_q} | \mathbf{Z,\psi,\eta}) = g(\psi_0 + \psi_1 S_q + \mathbf{\eta Z}) ]$
+$[ \mathbb{E}(Y | \mathbf{X,\beta}) = \beta_0 + \beta_1 X_1 + \beta_2 X_2 + \beta_3 X_3 ]$
+
+```{r}
+
+start.time <- Sys.time()
+
+set.seed(50)
+print(exposure_vars)
+
+qg_results3b = qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + no_grad_mcare + log_med_income + owner_occupied + median_age + log_ndvi + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=qg_combined_data2, family=poisson(), q=10, bayes=TRUE)
+  # qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3 + offset(log(population)), data=combined_01,
+  #                  expnms=exposure_vars,
+  #                  family=poisson(), q=10, breaks=NULL, weights, alpha = 0.05, B = 200, rr = TRUE, degree = 1, bayes=FALSE, MCsize=nrow(combined_01))
+
+print(qg_results3b)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+
+```
+
+
+# GLM BOOT - Time/Month spline w/ df = 10 only with New York County alone
+```{r}
+start.time <- Sys.time()
+
+one_county <- qg_combined_data2 |> filter(GEOID10 == 36061)
+
+qg_results_boot_countyonly = qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + log_med_income + owner_occupied + median_age + log_ndvi + ns(year_month_numeric, df=10) + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=one_county, family=poisson(), q=10,  B=200, bayes=TRUE)
+
+print(qg_results_boot_countyonly)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+```
+
+# GLM BOOT - NO Time/Month spline w/ df = 10 only with New York County alone
+```{r}
+start.time <- Sys.time()
+
+one_county <- qg_combined_data2 |> filter(GEOID10 == 36061)
+
+qg_results_boot_only = qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + log_med_income + owner_occupied + median_age + log_ndvi + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=one_county, family=poisson(), q=10,  B=200, bayes=TRUE)
+
+print(qg_results_boot_only)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+```
+
+
+
+
+# GLM BOOT - Final QGCOMP Model
+```{r}
+start.time <- Sys.time()
+
+set.seed(50)
+
+qg_results_filtered = qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + log_med_income + owner_occupied + median_age + log_ndvi + factor(GEOID10) + ns(year_month_numeric, df=10) + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=qg_combined_data2, family=poisson(), q=10, B=200, bayes=TRUE)
+
+print(qg_results_filtered)
+qg_results_filtered
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+```
+
+# GLM BOOT - Spatial/County fixed effect only
+```{r}
+start.time <- Sys.time()
+
+qg_results_boot_countyonly = qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + log_med_income + owner_occupied + median_age + log_ndvi + factor(GEOID10) + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=qg_combined_data2, family=poisson(), q=10,  B=200, bayes=TRUE)
+
+print(qg_results_boot_countyonly)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+```
+
+# GLM BOOT - Time/Month spline w/ df = 10 only
+```{r}
+start.time <- Sys.time()
+
+qg_results_boot_timeonly = qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + log_med_income + owner_occupied + median_age + log_ndvi + ns(year_month_numeric, df=10) + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=qg_combined_data2, family=poisson(), q=10,  B=200, bayes=TRUE)
+
+print(qg_results_boot_timeonly)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+```
+
+# GLM BOOT - Both Spatial/County fixed effect and Time/Month spline w/ df = 10
+```{r}
+start.time <- Sys.time()
+
+qg_results_boot_both = qgcomp.glm.boot(Deaths ~ pm25 + no2 + o3  + white_pct + hispanic_pct + blk_pct + native_pct + asian_pct + log_med_income + owner_occupied + median_age + log_ndvi + factor(GEOID10) + ns(year_month_numeric, df=10) + offset(log(population)),
+                     expnms=exposure_vars,
+                     data=qg_combined_data2, family=poisson(), q=10,  B=200, bayes=TRUE)
+
+print(qg_results_boot_both)
+
+summary(qg_results_boot_both$fit)$coefficients
+
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(time.taken)
+
+```
+
+## Loading Results
+```{r}
+# Model accounting for spatial and temporal confounding
+print(qg_results_boot_both)
+plot(qg_results_boot_both)
+
+# Model accounting for spatial confounding alone
+print(qg_results_boot_countyonly)
+plot(qg_results_boot_countyonly)
+
+# Model accounting for temporal confounding alone
+print(qg_results_boot_timeonly)
+plot(qg_results_boot_timeonly)
+
+```
+
+# 
+```{r}
+extract_qgcomp_results <- function(mod, model_name) {
+  est <- format(as.numeric(mod$psi), digits = 5)
+  pval <- format(as.numeric(mod$pval["psi1"]), digits = 5)  # Grab only psi1
+  ci_low <- format(mod$ci[1], digits = 5)
+  ci_high <- format(mod$ci[2], digits = 5)
+
+  # Create data frame
+  results <- data.frame(
+    Model = model_name,
+    Estimate = est,
+    CI_Lower = ci_low,
+    CI_Upper = ci_high,
+    P_Value = pval,
+    stringsAsFactors = FALSE
+  )
+  
+  # Rename columns to have spaces
+  colnames(results) <- c("Model", "Estimate", "CI Lower", "CI Upper", "P Value")
+  
+  return(results)
+}
+
+res1 <- extract_qgcomp_results(qg_results_boot_both, "Spatial Fixed Effect and Temporal Spline-Adjusted Variable")
+res2 <- extract_qgcomp_results(qg_results_boot_countyonly, "Spatial Fixed Effect")
+res3 <- extract_qgcomp_results(qg_results_boot_timeonly, "Temporal Spline-Adjusted Variable")
+
+combined_results <- rbind(res1, res2, res3)
+
+library(knitr)
+kable(combined_results, digits = 3, caption = "QGComp Model Summary")
+
+```
+
+```{r}
+qg_results_boot_both <- readRDS("qg_both.R")
+qg_results_boot_countyonly <- readRDS("qg_countyonly.R")
+qg_results_boot_timeonly <- readRDS("qg_time_only.R")
+```
+
+```{r}
+# Define the extraction function (unchanged)
+extract_qgcomp_results <- function(mod, model_name) {
+  est <- format(as.numeric(mod$psi), digits = 5)
+  pval <- format(as.numeric(mod$pval["psi1"]), digits = 5)
+  ci_low <- format(mod$ci[1], digits = 5)
+  ci_high <- format(mod$ci[2], digits = 5)
+
+  results <- data.frame(
+    Model = model_name,
+    Estimate = est,
+    CI_Lower = ci_low,
+    CI_Upper = ci_high,
+    P_Value = pval,
+    stringsAsFactors = FALSE
+  )
+  
+  colnames(results) <- c("Model", "Estimate", "CI Lower", "CI Upper", "P Value")
+  return(results)
+}
+
+# Extract individual results
+res1 <- extract_qgcomp_results(qg_results_boot_both, "Spatial Fixed Effect and Temporal Spline-Adjusted Variable")
+res2 <- extract_qgcomp_results(qg_results_boot_countyonly, "Spatial Fixed Effect")
+res3 <- extract_qgcomp_results(qg_results_boot_timeonly, "Temporal Spline-Adjusted Variable")
+
+# Create two separate tables
+main_model_table <- res1
+reduced_models_table <- rbind(res2, res3)
+
+# Display tables using kable
+library(knitr)
+
+kable(main_model_table, digits = 3, caption = "Main Model: Spatial Fixed Effect and Temporal Spline-Adjusted Variable")
+
+kable(reduced_models_table, digits = 3, caption = "Models for Sensitivity Analysis: Spatial Only and Temporal Only")
+
+
+```
+
+
+# Jan 2000 Median and IQR for Pollutant Concentrations
+```{r}
+library(dplyr)
+library(tidyr)
+library(knitr)
+library(kableExtra)
+
+# Step 1: Extract year
+pollution_data <- qg_combined_data2 %>%
+  mutate(year = substr(year_month, 1, 4))
+
+# Function to calculate median and IQR
+get_stats <- function(data, group_label) {
+  data.frame(
+    Group = group_label,
+    Pollutant = c("NO2", "PM2.5", "O3"),
+    Median = c(
+      median(data$no2, na.rm = TRUE),
+      median(data$pm25, na.rm = TRUE),
+      median(data$o3, na.rm = TRUE)
+    ),
+    Q1 = c(
+      quantile(data$no2, 0.25, na.rm = TRUE),
+      quantile(data$pm25, 0.25, na.rm = TRUE),
+      quantile(data$o3, 0.25, na.rm = TRUE)
+    ),
+    Q3 = c(
+      quantile(data$no2, 0.75, na.rm = TRUE),
+      quantile(data$pm25, 0.75, na.rm = TRUE),
+      quantile(data$o3, 0.75, na.rm = TRUE)
+    )
+  )
+}
+
+# Generate summaries
+yearly_summary <- pollution_data %>%
+  filter(year %in% as.character(2000:2016)) %>%
+  group_by(year) %>%
+  group_map(~get_stats(.x, .y$year[1])) %>%
+  bind_rows()
+
+# jan_2000_summary <- get_stats(filter(pollution_data, year_month == "2000-01"), "Jan 2000")
+
+# Combine summaries
+all_summary <- bind_rows(yearly_summary) %>%
+  mutate(
+    IQR = paste0("[", round(Q1, 1), ", ", round(Q3, 1), "]")
+  ) %>%
+  select(Group, Pollutant, Median, IQR)
+
+# Pivot wider — each pollutant gets its own pair of columns
+wide_summary <- all_summary %>%
+  pivot_wider(
+    names_from = Pollutant,
+    values_from = c(Median, IQR),
+    names_glue = "{Pollutant}_{.value}"
+  )
+
+# Sort by date
+wide_summary <- wide_summary %>%
+  mutate(date_group = as.Date(ifelse(Group == "Jan 2000", "2000-01-01", paste0(Group, "-01-01")))) %>%
+  arrange(date_group) %>%
+  select(-date_group)
+
+# Rename for pretty output
+colnames(wide_summary) <- c(
+  "Year",
+  "NO₂ Median (ppb)", "PM2.5 Median (ug/m^3)", "O₃ Median (ppb)",
+  "NO₂ IQR (ppb)", "PM2.5 IQR (ug/m^3)", "O₃ IQR (ppb)"
+)
+
+# Display the table
+kable(wide_summary, format = "html", digits = 1, align = "c", escape = FALSE) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed", "responsive"),
+    full_width = FALSE,
+    position = "center"
+  ) %>%
+  add_header_above(c(" " = 1, "NO₂" = 2, "PM2.5" = 2, "O₃" = 2)) %>%
+  kable_paper("hover", full_width = FALSE) %>%
+  footnote(
+    general = "Summary statistics shown for each year and January 2000, with median and interquartile range [Q1, Q3] for each pollutant.",
+    general_title = "Note:"
+  )
+
+```
+
+```{r}
+
+library(ggplot2)
+library(gridExtra)
+
+# Create the table using ggplot2 and gridExtra
+table_plot <- ggplot() +
+  theme_void() +  # Remove axes and background
+  annotation_custom(
+    grob = tableGrob(wide_summary, theme = ttheme_minimal()),  # Using the tableGrob function
+    xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf
+  )
+
+# Save the table as a PNG file
+# Adjust the width and height to fit the table properly
+ggsave("pollution_table_ggplot.png", plot = table_plot, width = 12, height = 25, dpi = 300)
+
+
+```
